@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # (c) 2015, Florian Apolloner <florian@apolloner.eu>
 #
@@ -21,7 +20,6 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-import pipes
 import os
 
 try:
@@ -33,6 +31,7 @@ from nose.tools import eq_, raises
 
 from ansible import constants as C
 from ansible.compat.six import text_type
+from ansible.compat.six.moves import shlex_quote
 from ansible.compat.tests import unittest
 from ansible.compat.tests.mock import patch, MagicMock, mock_open
 
@@ -165,7 +164,7 @@ class TestActionBase(unittest.TestCase):
 
         # create a mock connection, so we don't actually try and connect to things
         def env_prefix(**args):
-            return ' '.join(['%s=%s' % (k, pipes.quote(text_type(v))) for k,v in args.items()])
+            return ' '.join(['%s=%s' % (k, shlex_quote(text_type(v))) for k,v in args.items()])
         mock_connection = MagicMock()
         mock_connection._shell.env_prefix.side_effect = env_prefix
 
@@ -465,6 +464,7 @@ class TestActionBase(unittest.TestCase):
 
         mock_connection = MagicMock()
         mock_connection.build_module_command.side_effect = build_module_command
+        mock_connection._shell.get_remote_filename.return_value = 'copy.py'
         mock_connection._shell.join_path.side_effect = os.path.join
 
         # we're using a real play context here

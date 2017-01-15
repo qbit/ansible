@@ -3,6 +3,7 @@
 set -eux
 
 ansible-playbook test_handlers.yml -i inventory.handlers -v "$@" --tags scenario1
+ansible-playbook test_listening_handlers.yml -i inventory.handlers -v "$@"
 
 [ "$(ansible-playbook test_handlers.yml -i inventory.handlers -v "$@" --tags scenario2 -l A \
 | egrep -o 'RUNNING HANDLER \[test_handlers : .*?]')" = "RUNNING HANDLER [test_handlers : test handler]" ]
@@ -34,3 +35,22 @@ ansible-playbook test_handlers.yml -i inventory.handlers -v "$@" --tags scenario
 # Forcing false in play, which overrides command line
 [ "$(ansible-playbook test_force_handlers.yml -i inventory.handlers -v "$@" --tags force_false_in_play --force-handlers \
 | egrep -o CALLED_HANDLER_. | sort | uniq | xargs)" = "CALLED_HANDLER_B" ]
+
+[ "$(ansible-playbook test_handlers_include.yml -i ../../inventory -v "$@" --tags playbook_include_handlers \
+| egrep -o 'RUNNING HANDLER \[.*?]')" = "RUNNING HANDLER [test handler]" ]
+
+[ "$(ansible-playbook test_handlers_include.yml -i ../../inventory -v "$@" --tags role_include_handlers \
+| egrep -o 'RUNNING HANDLER \[test_handlers_include : .*?]')" = "RUNNING HANDLER [test_handlers_include : test handler]" ]
+
+# Notify handler listen
+ansible-playbook test_handlers_listen.yml -i inventory.handlers -v "$@"
+
+# Notify inexistent handlers results in error
+set +e
+result="$(ansible-playbook test_handlers_inexistent_notify.yml -i inventory.handlers "$@" 2>&1)"
+set -e
+grep -q "ERROR! The requested handler 'notify_inexistent_handler' was not found in either the main handlers list nor in the listening handlers list" <<< "$result"
+
+# Notify inexistent handlers without errors when ANSIBLE_ERROR_ON_MISSING_HANDLER=false
+ANSIBLE_ERROR_ON_MISSING_HANDLER=false ansible-playbook test_handlers_inexistent_notify.yml -i inventory.handlers -v "$@"
+

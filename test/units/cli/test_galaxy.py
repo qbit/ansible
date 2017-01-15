@@ -112,6 +112,20 @@ class TestGalaxy(unittest.TestCase):
         if display_result.find('\n\tgalaxy_info:') == -1:
             self.fail('Expected galaxy_info to be indented once')
 
+    def test_run(self):
+        ''' verifies that the GalaxyCLI object's api is created and that execute() is called. '''
+        gc = GalaxyCLI(args=["install"])
+        with patch('sys.argv', ["-c", "-v", '--ignore-errors', 'imaginary_role']):
+            galaxy_parser = gc.parse()
+        with patch.object(ansible.cli.CLI, "execute", return_value=None) as mock_ex:
+            with patch.object(ansible.cli.CLI, "run", return_value=None) as mock_run:
+                gc.run()
+                
+                # testing
+                self.assertEqual(mock_run.call_count, 1)
+                self.assertTrue(isinstance(gc.api, ansible.galaxy.api.GalaxyAPI))
+                self.assertEqual(mock_ex.call_count, 1)
+
     def test_execute_remove(self):
         # installing role
         gc = GalaxyCLI(args=["install", "--offline", "-p", self.role_path, "-r", self.role_req])
@@ -135,7 +149,7 @@ class TestGalaxy(unittest.TestCase):
 
     def test_exit_without_ignore(self):
         ''' tests that GalaxyCLI exits with the error specified unless the --ignore-errors flag is used '''
-        gc = GalaxyCLI(args=["install", "-c", "fake_role_name"])
+        gc = GalaxyCLI(args=["install", "--server=None", "-c", "fake_role_name"])
 
         # testing without --ignore-errors flag
         galaxy_parser = gc.parse()
@@ -145,7 +159,7 @@ class TestGalaxy(unittest.TestCase):
             self.assertTrue(mocked_display.called_once_with("- downloading role 'fake_role_name', owned by "))
 
         # testing with --ignore-errors flag
-        gc = GalaxyCLI(args=["install", "-c", "fake_role_name", "--ignore-errors"])
+        gc = GalaxyCLI(args=["install", "--server=None", "-c", "fake_role_name", "--ignore-errors"])
         galalxy_parser = gc.parse()
         with patch.object(ansible.utils.display.Display, "display", return_value=None) as mocked_display:
             # testing that error expected is not raised with --ignore-errors flag in use

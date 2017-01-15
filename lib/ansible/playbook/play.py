@@ -20,6 +20,7 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 from ansible.compat.six import string_types
+from ansible import constants as C
 
 from ansible.errors import AnsibleParserError
 
@@ -63,6 +64,7 @@ class Play(Base, Taggable, Become):
     _accelerate_port     = FieldAttribute(isa='int', default=5099, always_post_validate=True)
 
     # Connection
+    _fact_path           = FieldAttribute(isa='string', default=None)
     _gather_facts        = FieldAttribute(isa='bool', default=None, always_post_validate=True)
     _gather_subset       = FieldAttribute(isa='barelist', default=None, always_post_validate=True)
     _gather_timeout      = FieldAttribute(isa='int', default=None, always_post_validate=True)
@@ -88,7 +90,7 @@ class Play(Base, Taggable, Become):
     _force_handlers      = FieldAttribute(isa='bool', always_post_validate=True)
     _max_fail_percentage = FieldAttribute(isa='percent', always_post_validate=True)
     _serial              = FieldAttribute(isa='list', default=[], always_post_validate=True)
-    _strategy            = FieldAttribute(isa='string', default='linear', always_post_validate=True)
+    _strategy            = FieldAttribute(isa='string', default=C.DEFAULT_STRATEGY, always_post_validate=True)
 
     # =================================================================================
 
@@ -96,6 +98,7 @@ class Play(Base, Taggable, Become):
         super(Play, self).__init__()
 
         self._included_path = None
+        self._removed_hosts = []
         self.ROLE_CACHE = {}
 
     def __repr__(self):
@@ -202,7 +205,7 @@ class Play(Base, Taggable, Become):
         for prompt_data in new_ds:
             if 'name' not in prompt_data:
                 display.deprecated("Using the 'short form' for vars_prompt has been deprecated")
-                for vname, prompt in prompt_data.iteritems():
+                for vname, prompt in prompt_data.items():
                     vars_prompts.append(dict(
                         name      = vname,
                         prompt    = prompt,

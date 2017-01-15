@@ -77,7 +77,7 @@ class AdHocCLI(CLI):
         if len(self.args) < 1:
             raise AnsibleOptionsError("Missing target hosts")
         elif len(self.args) > 1:
-            raise AnsibleOptionsError("Extranous options or arguments")
+            raise AnsibleOptionsError("Extraneous options or arguments")
 
         display.verbosity = self.options.verbosity
         self.validate_conflicts(runas_opts=True, vault_opts=True, fork_opts=True)
@@ -118,7 +118,7 @@ class AdHocCLI(CLI):
             vault_pass = CLI.read_vault_password_file(self.options.vault_password_file, loader=loader)
             loader.set_vault_password(vault_pass)
         elif self.options.ask_vault_pass:
-            vault_pass = self.ask_vault_passwords()[0]
+            vault_pass = self.ask_vault_passwords()
             loader.set_vault_password(vault_pass)
 
         variable_manager = VariableManager()

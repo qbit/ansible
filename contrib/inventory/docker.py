@@ -444,7 +444,7 @@ class AnsibleDockerClient(Client):
             tls_config = TLSConfig(**kwargs)
             return tls_config
         except TLSParameterError as exc:
-           self.fail("TLS config error: %s" % exc)
+            self.fail("TLS config error: %s" % exc)
 
     def _get_connect_params(self):
         auth = self.auth_params
@@ -609,7 +609,7 @@ class DockerInventory(object):
 
                 self.groups[id].append(name)
                 self.groups[name].append(name)
-                if short_id not in self.groups.keys():
+                if short_id not in self.groups:
                     self.groups[short_id].append(name)
                 self.groups[hostname].append(name)
 

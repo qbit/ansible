@@ -95,7 +95,7 @@ class ConsoleCLI(CLI, cmd.Cmd):
 
         self.parser.set_defaults(cwd='*')
 
-        super(AdHocCLI, self).parse()
+        super(ConsoleCLI, self).parse()
 
         display.verbosity = self.options.verbosity
         self.validate_conflicts(runas_opts=True, vault_opts=True, fork_opts=True)
@@ -356,7 +356,7 @@ class ConsoleCLI(CLI, cmd.Cmd):
         if module_name in self.modules:
             in_path = module_loader.find_plugin(module_name)
             if in_path:
-                oc, a, _ = module_docs.get_docstring(in_path)
+                oc, a, _, _ = module_docs.get_docstring(in_path)
                 if oc:
                     display.display(oc['short_description'])
                     display.display('Parameters:')
@@ -388,8 +388,8 @@ class ConsoleCLI(CLI, cmd.Cmd):
 
     def module_args(self, module_name):
         in_path = module_loader.find_plugin(module_name)
-        oc, a, _ = module_docs.get_docstring(in_path)
-        return oc['options'].keys()
+        oc, a, _, _ = module_docs.get_docstring(in_path)
+        return list(oc['options'].keys())
 
     def run(self):
 

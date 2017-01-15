@@ -22,7 +22,6 @@ __metaclass__ = type
 import base64
 import json
 import os
-import pipes
 import random
 import re
 import stat
@@ -30,15 +29,17 @@ import tempfile
 import time
 from abc import ABCMeta, abstractmethod
 
-from ansible.compat.six import binary_type, text_type, iteritems, with_metaclass
-
 from ansible import constants as C
+from ansible.compat.six import binary_type, string_types, text_type, iteritems, with_metaclass
+from ansible.compat.six.moves import shlex_quote
 from ansible.errors import AnsibleError, AnsibleConnectionFailure
 from ansible.executor.module_common import modify_module
 from ansible.module_utils._text import to_bytes, to_native, to_text
 from ansible.module_utils.json_utils import _filter_non_json_lines
 from ansible.parsing.utils.jsonify import jsonify
+from ansible.playbook.play_context import MAGIC_VARIABLE_MAPPING
 from ansible.release import __version__
+from ansible.vars.unsafe_proxy import wrap_var
 
 
 try:
@@ -145,7 +146,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             else:
                 raise AnsibleError("The module %s was not found in configured module paths. "
                                    "Additionally, core modules are missing. If this is a checkout, "
-                                   "run 'git submodule update --init --recursive' to correct this problem." % (module_name))
+                                   "run 'git pull --rebase' to correct this problem." % (module_name))
 
         # insert shared code and arguments into the module
         (module_data, module_style, module_shebang) = modify_module(module_name, module_path, module_args,
@@ -358,11 +359,16 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             # Try to use file system acls to make the files readable for sudo'd
             # user
             if execute:
-                mode = 'rx'
+                chmod_mode = 'rx'
+                setfacl_mode = 'r-x'
             else:
-                mode = 'rX'
+                chmod_mode = 'rX'
+                ### Note: this form fails silently on freebsd.  We currently
+                # never call _fixup_perms2() with execute=False but if we
+                # start to we'll have to fix this.
+                setfacl_mode = 'r-X'
 
-            res = self._remote_set_user_facl(remote_paths, self._play_context.become_user, mode)
+            res = self._remote_set_user_facl(remote_paths, self._play_context.become_user, setfacl_mode)
             if res['rc'] != 0:
                 # File system acls failed; let's try to use chown next
                 # Set executable bit first as on some systems an
@@ -370,7 +376,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                 if execute:
                     res = self._remote_chmod(remote_paths, 'u+x')
                     if res['rc'] != 0:
-                        raise AnsibleError('Failed to set file mode on remote temporary files (rc: {0}, err: {1})'.format(res['rc'], res['stderr']))
+                        raise AnsibleError('Failed to set file mode on remote temporary files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
 
                 res = self._remote_chown(remote_paths, self._play_context.become_user)
                 if res['rc'] != 0 and remote_user == 'root':
@@ -384,20 +390,20 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                         display.warning('Using world-readable permissions for temporary files Ansible needs to create when becoming an unprivileged user.'
                                 ' This may be insecure. For information on securing this, see'
                                 ' https://docs.ansible.com/ansible/become.html#becoming-an-unprivileged-user')
-                        res = self._remote_chmod(remote_paths, 'a+%s' % mode)
+                        res = self._remote_chmod(remote_paths, 'a+%s' % chmod_mode)
                         if res['rc'] != 0:
-                            raise AnsibleError('Failed to set file mode on remote files (rc: {0}, err: {1})'.format(res['rc'], res['stderr']))
+                            raise AnsibleError('Failed to set file mode on remote files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
                     else:
                         raise AnsibleError('Failed to set permissions on the temporary files Ansible needs to create when becoming an unprivileged user'
                                 ' (rc: {0}, err: {1}). For information on working around this,'
-                                ' see https://docs.ansible.com/ansible/become.html#becoming-an-unprivileged-user'.format(res['rc'], res['stderr']))
+                                ' see https://docs.ansible.com/ansible/become.html#becoming-an-unprivileged-user'.format(res['rc'], to_native(res['stderr'])))
         elif execute:
             # Can't depend on the file being transferred with execute
             # permissions.  Only need user perms because no become was
             # used here
             res = self._remote_chmod(remote_paths, 'u+x')
             if res['rc'] != 0:
-                raise AnsibleError('Failed to set file mode on remote files (rc: {0}, err: {1})'.format(res['rc'], res['stderr']))
+                raise AnsibleError('Failed to set file mode on remote files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
 
         return remote_paths
 
@@ -438,8 +444,13 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         )
         mystat = self._execute_module(module_name='stat', module_args=module_args, task_vars=all_vars, tmp=tmp, delete_remote_tmp=(tmp is None))
 
-        if 'failed' in mystat and mystat['failed']:
-            raise AnsibleError('Failed to get information on remote file (%s): %s' % (path, mystat['msg']))
+        if mystat.get('failed'):
+            msg = mystat.get('module_stderr')
+            if not msg:
+              msg = mystat.get('module_stdout')
+            if not msg:
+              msg = mystat.get('msg')
+            raise AnsibleError('Failed to get information on remote file (%s): %s' % (path, msg))
 
         if not mystat['stat']['exists']:
             # empty might be matched, 1 should never match, also backwards compatible
@@ -448,6 +459,8 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         # happens sometimes when it is a dir and not on bsd
         if 'checksum' not in mystat['stat']:
             mystat['stat']['checksum'] = ''
+        elif not isinstance(mystat['stat']['checksum'], string_types):
+            raise AnsibleError("Invalid checksum returned by stat: expected a string type but got %s" % type(mystat['stat']['checksum']))
 
         return mystat['stat']
 
@@ -461,7 +474,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         3 = its a directory, not a file
         4 = stat module failed, likely due to not finding python
         '''
-        x = "0"  # unknown error has occured
+        x = "0"  # unknown error has occurred
         try:
             remote_stat = self._execute_remote_stat(path, all_vars, follow=follow)
             if remote_stat['exists'] and remote_stat['isdir']:
@@ -512,19 +525,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             data = re.sub(r'^((\r)?\n)?BECOME-SUCCESS.*(\r)?\n', '', data)
         return data
 
-    def _execute_module(self, module_name=None, module_args=None, tmp=None, task_vars=None, persist_files=False, delete_remote_tmp=True):
-        '''
-        Transfer and run a module along with its arguments.
-        '''
-        if task_vars is None:
-            task_vars = dict()
-
-        # if a module name was not specified for this execution, use
-        # the action from the task
-        if module_name is None:
-            module_name = self._task.action
-        if module_args is None:
-            module_args = self._task.args
+    def _update_module_args(self, module_name, module_args, task_vars):
 
         # set check mode in the module arguments, if required
         if self._play_context.check_mode:
@@ -533,9 +534,6 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             module_args['_ansible_check_mode'] = True
         else:
             module_args['_ansible_check_mode'] = False
-
-        # Get the connection user for permission checks
-        remote_user = task_vars.get('ansible_ssh_user') or self._play_context.remote_user
 
         # set no log in the module arguments, if required
         module_args['_ansible_no_log'] = self._play_context.no_log or C.DEFAULT_NO_TARGET_SYSLOG
@@ -560,6 +558,25 @@ class ActionBase(with_metaclass(ABCMeta, object)):
 
         # let module know about filesystems that selinux treats specially
         module_args['_ansible_selinux_special_fs'] = C.DEFAULT_SELINUX_SPECIAL_FS
+
+    def _execute_module(self, module_name=None, module_args=None, tmp=None, task_vars=None, persist_files=False, delete_remote_tmp=True):
+        '''
+        Transfer and run a module along with its arguments.
+        '''
+        if task_vars is None:
+            task_vars = dict()
+
+        # if a module name was not specified for this execution, use
+        # the action from the task
+        if module_name is None:
+            module_name = self._task.action
+        if module_args is None:
+            module_args = self._task.args
+
+        # Get the connection user for permission checks
+        remote_user = task_vars.get('ansible_ssh_user') or self._play_context.remote_user
+
+        self._update_module_args(module_name, module_args, task_vars)
 
         (module_style, shebang, module_data, module_path) = self._configure_module(module_name=module_name, module_args=module_args, task_vars=task_vars)
         display.vvv("Using module file %s" % module_path)
@@ -595,7 +612,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                 # the remote system, which can be read and parsed by the module
                 args_data = ""
                 for k,v in iteritems(module_args):
-                    args_data += '%s=%s ' % (k, pipes.quote(text_type(v)))
+                    args_data += '%s=%s ' % (k, shlex_quote(text_type(v)))
                 self._transfer_data(args_file_path, args_data)
             elif module_style in ('non_native_want_json', 'binary'):
                 self._transfer_data(args_file_path, json.dumps(module_args))
@@ -663,13 +680,61 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         display.debug("done with _execute_module (%s, %s)" % (module_name, module_args))
         return data
 
+    def _remove_internal_keys(self, data):
+        for key in list(data.keys()):
+            if key.startswith('_ansible_') or key in C.INTERNAL_RESULT_KEYS:
+                display.warning("Removed unexpected internal key in module return: %s = %s" % (key, data[key]))
+                del data[key]
+
+    def _clean_returned_data(self, data):
+        remove_keys = set()
+        fact_keys = set(data.keys())
+        # first we add all of our magic variable names to the set of
+        # keys we want to remove from facts
+        for magic_var in MAGIC_VARIABLE_MAPPING:
+            remove_keys.update(fact_keys.intersection(MAGIC_VARIABLE_MAPPING[magic_var]))
+        # next we remove any connection plugin specific vars
+        for conn_path in self._shared_loader_obj.connection_loader.all(path_only=True):
+            try:
+                conn_name = os.path.splitext(os.path.basename(conn_path))[0]
+                re_key = re.compile('^ansible_%s_' % conn_name)
+                for fact_key in fact_keys:
+                    if re_key.match(fact_key):
+                        remove_keys.add(fact_key)
+            except AttributeError:
+                pass
+
+        # remove some KNOWN keys
+        for hard in C.RESTRICTED_RESULT_KEYS + C.INTERNAL_RESULT_KEYS:
+            if hard in fact_keys:
+                remove_keys.add(hard)
+
+        # finally, we search for interpreter keys to remove
+        re_interp = re.compile('^ansible_.*_interpreter$')
+        for fact_key in fact_keys:
+            if re_interp.match(fact_key):
+                remove_keys.add(fact_key)
+        # then we remove them (except for ssh host keys)
+        for r_key in remove_keys:
+            if not r_key.startswith('ansible_ssh_host_key_'):
+                display.warning("Removed restricted key from module data: %s = %s" % (r_key, data[r_key]))
+                del data[r_key]
+
+        self._remove_internal_keys(data)
+
     def _parse_returned_data(self, res):
         try:
             filtered_output, warnings = _filter_non_json_lines(res.get('stdout', u''))
             for w in warnings:
                 display.warning(w)
+
             data = json.loads(filtered_output)
+            self._remove_internal_keys(data)
             data['_ansible_parsed'] = True
+
+            if 'ansible_facts' in data and isinstance(data['ansible_facts'], dict):
+                self._clean_returned_data(data['ansible_facts'])
+                data['ansible_facts'] = wrap_var(data['ansible_facts'])
         except ValueError:
             # not valid json, lets try to capture error
             data = dict(failed=True, _ansible_parsed=False)
@@ -679,6 +744,8 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                 data['module_stderr'] = res['stderr']
                 if res['stderr'].startswith(u'Traceback'):
                     data['exception'] = res['stderr']
+            if 'rc' in res:
+                data['rc'] = res['rc']
         return data
 
     def _low_level_execute_command(self, cmd, sudoable=True, in_data=None, executable=None, encoding_errors='surrogate_or_replace'):
@@ -715,7 +782,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                 # only applied for the default executable to avoid interfering with the raw action
                 cmd = self._connection._shell.append_command(cmd, 'sleep 0')
             if executable:
-                cmd = executable + ' -c ' + pipes.quote(cmd)
+                cmd = executable + ' -c ' + shlex_quote(cmd)
 
         display.debug("_low_level_execute_command(): executing: %s" % (cmd,))
 
@@ -760,13 +827,13 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         display.debug("Going to peek to see if file has changed permissions")
         peek_result = self._execute_module(module_name='file', module_args=dict(path=destination, diff_peek=True), task_vars=task_vars, persist_files=True)
 
-        if not('failed' in peek_result and peek_result['failed']) or peek_result.get('rc', 0) == 0:
+        if not peek_result.get('failed', False) or peek_result.get('rc', 0) == 0:
 
-            if peek_result['state'] == 'absent':
+            if peek_result.get('state') == 'absent':
                 diff['before'] = ''
-            elif peek_result['appears_binary']:
+            elif peek_result.get('appears_binary'):
                 diff['dst_binary'] = 1
-            elif C.MAX_FILE_SIZE_FOR_DIFF > 0 and peek_result['size'] > C.MAX_FILE_SIZE_FOR_DIFF:
+            elif peek_result.get('size') and C.MAX_FILE_SIZE_FOR_DIFF > 0 and peek_result['size'] > C.MAX_FILE_SIZE_FOR_DIFF:
                 diff['dst_larger'] = C.MAX_FILE_SIZE_FOR_DIFF
             else:
                 display.debug("Slurping the file %s" % source)
@@ -806,7 +873,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             if 'before' in diff:
                 diff["before"] = ""
             if 'after' in diff:
-                diff["after"] = " [[ Diff output has been hidden because 'no_log: true' was specified for this result ]]"
+                diff["after"] = " [[ Diff output has been hidden because 'no_log: true' was specified for this result ]]\n"
 
         return diff
 
@@ -817,6 +884,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             to get back the first existing file found.
         '''
 
+        # dwim already deals with playbook basedirs
         path_stack = self._task.get_search_path()
 
         result = self._loader.path_dwim_relative_stack(path_stack, dirname, needle)

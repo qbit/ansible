@@ -129,6 +129,12 @@ class StrategyBase:
         self._results_thread.join()
 
     def run(self, iterator, play_context, result=0):
+        # execute one more pass through the iterator without peeking, to
+        # make sure that all of the hosts are advanced to their final task.
+        # This should be safe, as everything should be ITERATING_COMPLETE by
+        # this point, though the strategy may not advance the hosts itself.
+        [iterator.get_next_task_for_host(host) for host in self._inventory.get_hosts(iterator._play.hosts) if host.name not in self._tqm._unreachable_hosts]
+
         # save the failed/unreachable hosts, as the run_handlers()
         # method will clear that information during its execution
         failed_hosts      = iterator.get_failed_hosts()
@@ -223,6 +229,13 @@ class StrategyBase:
             return
         display.debug("exiting _queue_task() for %s/%s" % (host.name, task.action))
 
+    def get_task_hosts(self, iterator, task_host, task):
+        if task.run_once:
+            host_list = [host for host in self._inventory.get_hosts(iterator._play.hosts) if host.name not in self._tqm._unreachable_hosts]
+        else:
+            host_list = [task_host]
+        return host_list
+
     def _process_pending_results(self, iterator, one_pass=False, max_passes=None):
         '''
         Reads results off the final queue and takes appropriate action
@@ -238,29 +251,38 @@ class StrategyBase:
             else:
                 return self._inventory.get_host(host_name)
 
-        def search_handler_blocks(handler_name, handler_blocks):
+        def search_handler_blocks_by_name(handler_name, handler_blocks):
             for handler_block in handler_blocks:
                 for handler_task in handler_block.block:
-                    handler_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, task=handler_task)
-                    templar = Templar(loader=self._loader, variables=handler_vars)
-                    try:
-                        # first we check with the full result of get_name(), which may
-                        # include the role name (if the handler is from a role). If that
-                        # is not found, we resort to the simple name field, which doesn't
-                        # have anything extra added to it.
-                        target_handler_name = templar.template(handler_task.name)
-                        if target_handler_name == handler_name:
-                            return handler_task
-                        else:
-                            target_handler_name = templar.template(handler_task.get_name())
+                    if handler_task.name:
+                        handler_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, task=handler_task)
+                        templar = Templar(loader=self._loader, variables=handler_vars)
+                        try:
+                            # first we check with the full result of get_name(), which may
+                            # include the role name (if the handler is from a role). If that
+                            # is not found, we resort to the simple name field, which doesn't
+                            # have anything extra added to it.
+                            target_handler_name = templar.template(handler_task.name)
                             if target_handler_name == handler_name:
                                 return handler_task
-                    except (UndefinedError, AnsibleUndefinedVariable):
-                        # We skip this handler due to the fact that it may be using
-                        # a variable in the name that was conditionally included via
-                        # set_fact or some other method, and we don't want to error
-                        # out unnecessarily
-                        continue
+                            else:
+                                target_handler_name = templar.template(handler_task.get_name())
+                                if target_handler_name == handler_name:
+                                    return handler_task
+                        except (UndefinedError, AnsibleUndefinedVariable):
+                            # We skip this handler due to the fact that it may be using
+                            # a variable in the name that was conditionally included via
+                            # set_fact or some other method, and we don't want to error
+                            # out unnecessarily
+                            continue
+            return None
+
+
+        def search_handler_blocks_by_uuid(handler_uuid, handler_blocks):
+            for handler_block in handler_blocks:
+                for handler_task in handler_block.block:
+                    if handler_uuid == handler_task._uuid:
+                        return handler_task
             return None
 
         def parent_handler_match(target_handler, handler_name):
@@ -282,6 +304,11 @@ class StrategyBase:
             else:
                 return False
 
+        # a Templar class to use for templating things later, as we're using
+        # original/non-validated objects here on the manager side. We set the
+        # variables in use later inside the loop below
+        templar = Templar(loader=self._loader)
+
         cur_pass = 0
         while True:
             try:
@@ -292,10 +319,23 @@ class StrategyBase:
             finally:
                 self._results_lock.release()
 
+            # get the original host and task.  We then assign them to the TaskResult for use in callbacks/etc.
             original_host = get_original_host(task_result._host)
             original_task = iterator.get_original_task(original_host, task_result._task)
+            
             task_result._host = original_host
             task_result._task = original_task
+
+            # get the correct loop var for use later
+            if original_task.loop_control:
+                loop_var = original_task.loop_control.loop_var or 'item'
+            else:
+                loop_var = 'item'
+
+            # get the vars for this task/host pair, make them the active set of vars for our templar above
+            task_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=original_host, task=original_task)
+            self.add_tqm_variables(task_vars, play=iterator._play)
+            templar.set_available_variables(task_vars)
 
             # send callbacks for 'non final' results
             if '_ansible_retry' in task_result._result:
@@ -313,11 +353,9 @@ class StrategyBase:
                     self._tqm.send_callback('v2_runner_item_on_ok', task_result)
                 continue
 
+            run_once = templar.template(original_task.run_once)
             if original_task.register:
-                if original_task.run_once:
-                    host_list = [host for host in self._inventory.get_hosts(iterator._play.hosts) if host.name not in self._tqm._unreachable_hosts]
-                else:
-                    host_list = [original_host]
+                host_list = self.get_task_hosts(iterator, original_host, original_task)
 
                 clean_copy = strip_internal_keys(task_result._result)
                 if 'invocation' in clean_copy:
@@ -330,9 +368,10 @@ class StrategyBase:
             role_ran = False
             if task_result.is_failed():
                 role_ran = True
-                if not original_task.ignore_errors:
+                ignore_errors = templar.template(original_task.ignore_errors)
+                if not ignore_errors:
                     display.debug("marking %s as failed" % original_host.name)
-                    if original_task.run_once:
+                    if run_once:
                         # if we're using run_once, we have to fail every host here
                         for h in self._inventory.get_hosts(iterator._play.hosts):
                             if h.name not in self._tqm._unreachable_hosts:
@@ -342,29 +381,33 @@ class StrategyBase:
                     else:
                         iterator.mark_host_failed(original_host)
 
-                    # only add the host to the failed list officially if it has
-                    # been failed by the iterator
-                    if iterator.is_failed(original_host):
+                    # increment the failed count for this host
+                    self._tqm._stats.increment('failures', original_host.name)
+
+                    # grab the current state and if we're iterating on the rescue portion
+                    # of a block then we save the failed task in a special var for use 
+                    # within the rescue/always
+                    state, _ = iterator.get_next_task_for_host(original_host, peek=True)
+
+                    if iterator.is_failed(original_host) and state and state.run_state == iterator.ITERATING_COMPLETE:
                         self._tqm._failed_hosts[original_host.name] = True
-                        self._tqm._stats.increment('failures', original_host.name)
-                    else:
-                        # otherwise, we grab the current state and if we're iterating on
-                        # the rescue portion of a block then we save the failed task in a
-                        # special var for use within the rescue/always
-                        state, _ = iterator.get_next_task_for_host(original_host, peek=True)
-                        if state.run_state == iterator.ITERATING_RESCUE:
-                            self._variable_manager.set_nonpersistent_facts(
-                                original_host,
-                                dict(
-                                    ansible_failed_task=original_task.serialize(),
-                                    ansible_failed_result=task_result._result,
-                                ),
-                                )
+
+                    if state and state.run_state == iterator.ITERATING_RESCUE:
+                        self._variable_manager.set_nonpersistent_facts(
+                            original_host,
+                            dict(
+                                ansible_failed_task=original_task.serialize(),
+                                ansible_failed_result=task_result._result,
+                            ),
+                        )
                 else:
                     self._tqm._stats.increment('ok', original_host.name)
-                self._tqm.send_callback('v2_runner_on_failed', task_result, ignore_errors=original_task.ignore_errors)
+                    if 'changed' in task_result._result and task_result._result['changed']:
+                        self._tqm._stats.increment('changed', original_host.name)
+                self._tqm.send_callback('v2_runner_on_failed', task_result, ignore_errors=ignore_errors)
             elif task_result.is_unreachable():
                 self._tqm._unreachable_hosts[original_host.name] = True
+                iterator._play._removed_hosts.append(original_host.name)
                 self._tqm._stats.increment('dark', original_host.name)
                 self._tqm.send_callback('v2_runner_on_unreachable', task_result)
             elif task_result.is_skipped():
@@ -393,30 +436,33 @@ class StrategyBase:
                                 # dependency chain of the current task (if it's from a role), otherwise
                                 # we just look through the list of handlers in the current play/all
                                 # roles and use the first one that matches the notify name
+                                target_handler = search_handler_blocks_by_name(handler_name, iterator._play.handlers)
+                                if target_handler is not None:
+                                    found = True
+                                    if original_host not in self._notified_handlers[target_handler._uuid]:
+                                        self._notified_handlers[target_handler._uuid].append(original_host)
+                                        # FIXME: should this be a callback?
+                                        display.vv("NOTIFIED HANDLER %s" % (handler_name,))
+                                else:
+                                    # As there may be more than one handler with the notified name as the
+                                    # parent, so we just keep track of whether or not we found one at all
+                                    for target_handler_uuid in self._notified_handlers:
+                                        target_handler = search_handler_blocks_by_uuid(target_handler_uuid, iterator._play.handlers)
+                                        if target_handler and parent_handler_match(target_handler, handler_name):
+                                            self._notified_handlers[target_handler._uuid].append(original_host)
+                                            display.vv("NOTIFIED HANDLER %s" % (target_handler.get_name(),))
+                                            found = True
+
                                 if handler_name in self._listening_handlers:
-                                    for listening_handler_name in self._listening_handlers[handler_name]:
-                                        listening_handler = search_handler_blocks(listening_handler_name, iterator._play.handlers)
+                                    for listening_handler_uuid in self._listening_handlers[handler_name]:
+                                        listening_handler = search_handler_blocks_by_uuid(listening_handler_uuid, iterator._play.handlers)
                                         if listening_handler is not None:
                                             found = True
-                                        if original_host not in self._notified_handlers[listening_handler]:
-                                            self._notified_handlers[listening_handler].append(original_host)
-                                            display.vv("NOTIFIED HANDLER %s" % (listening_handler_name,))
-                                else:
-                                    target_handler = search_handler_blocks(handler_name, iterator._play.handlers)
-                                    if target_handler is not None:
-                                        found = True
-                                        if original_host not in self._notified_handlers[target_handler]:
-                                            self._notified_handlers[target_handler].append(original_host)
-                                            # FIXME: should this be a callback?
-                                            display.vv("NOTIFIED HANDLER %s" % (handler_name,))
-                                    else:
-                                        # As there may be more than one handler with the notified name as the
-                                        # parent, so we just keep track of whether or not we found one at all
-                                        for target_handler in self._notified_handlers:
-                                            if parent_handler_match(target_handler, handler_name):
-                                                self._notified_handlers[target_handler].append(original_host)
-                                                display.vv("NOTIFIED HANDLER %s" % (target_handler.get_name(),))
-                                                found = True
+                                        else:
+                                            continue
+                                        if original_host not in self._notified_handlers[listening_handler._uuid]:
+                                            self._notified_handlers[listening_handler._uuid].append(original_host)
+                                            display.vv("NOTIFIED HANDLER %s" % (listening_handler.get_name(),))
 
                                 # and if none were found, then we raise an error
                                 if not found:
@@ -435,23 +481,13 @@ class StrategyBase:
                         # this task added a new group (group_by module)
                         self._add_group(original_host, result_item)
 
-                    elif 'ansible_facts' in result_item:
-
-                        # set correct loop var
-                        if original_task.loop_control:
-                            loop_var = original_task.loop_control.loop_var or 'item'
-                        else:
-                            loop_var = 'item'
-
-                        item = result_item.get(loop_var, None)
+                    if 'ansible_facts' in result_item:
 
                         # if delegated fact and we are delegating facts, we need to change target host for them
                         if original_task.delegate_to is not None and original_task.delegate_facts:
-                            task_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=original_host, task=original_task)
-                            self.add_tqm_variables(task_vars, play=iterator._play)
+                            item = result_item.get(loop_var, None)
                             if item is not None:
                                 task_vars[loop_var] = item
-                            templar = Templar(loader=self._loader, variables=task_vars)
                             host_name = templar.template(original_task.delegate_to)
                             actual_host = self._inventory.get_host(host_name)
                             if actual_host is None:
@@ -459,29 +495,36 @@ class StrategyBase:
                         else:
                             actual_host = original_host
 
+                        host_list = self.get_task_hosts(iterator, actual_host, original_task)
                         if original_task.action == 'include_vars':
+
                             for (var_name, var_value) in iteritems(result_item['ansible_facts']):
-                                # find the host we're actually refering too here, which may
+                                # find the host we're actually referring too here, which may
                                 # be a host that is not really in inventory at all
-
-                                if original_task.run_once:
-                                    host_list = [host for host in self._inventory.get_hosts(iterator._play.hosts) if host.name not in self._tqm._unreachable_hosts]
-                                else:
-                                    host_list = [actual_host]
-
                                 for target_host in host_list:
                                     self._variable_manager.set_host_variable(target_host, var_name, var_value)
                         else:
-                            if original_task.run_once:
-                                host_list = [host for host in self._inventory.get_hosts(iterator._play.hosts) if host.name not in self._tqm._unreachable_hosts]
-                            else:
-                                host_list = [actual_host]
-
                             for target_host in host_list:
                                 if original_task.action == 'set_fact':
                                     self._variable_manager.set_nonpersistent_facts(target_host, result_item['ansible_facts'].copy())
                                 else:
                                     self._variable_manager.set_host_facts(target_host, result_item['ansible_facts'].copy())
+
+                    if 'ansible_stats' in result_item and 'data' in result_item['ansible_stats'] and result_item['ansible_stats']['data']:
+
+                        if 'per_host' not in result_item['ansible_stats'] or result_item['ansible_stats']['per_host']:
+                            host_list = self.get_task_hosts(iterator, original_host, original_task)
+                        else:
+                            host_list = [None]
+
+                        data = result_item['ansible_stats']['data']
+                        aggregate = 'aggregate' in result_item['ansible_stats'] and result_item['ansible_stats']['aggregate']
+                        for myhost in host_list:
+                            for k in data.keys():
+                                if aggregate:
+                                    self._tqm._stats.update_custom_stats(k, data[k], myhost)
+                                else:
+                                    self._tqm._stats.set_custom_stats(k, data[k], myhost)
 
                 if 'diff' in task_result._result:
                     if self._diff:
@@ -606,9 +649,6 @@ class StrategyBase:
         group_name = result_item.get('add_group')
         new_group = self._inventory.get_group(group_name)
         if not new_group:
-            # clear cache of group dict, which is used in magic host variables
-            self._inventory.clear_group_dict_cache()
-
             # create the new group and add it to inventory
             new_group = Group(name=group_name)
             self._inventory.add_group(new_group)
@@ -622,6 +662,10 @@ class StrategyBase:
         if group_name not in host.get_groups():
             new_group.add_host(real_host)
             changed = True
+            
+        if changed:
+            # clear cache of group dict, which is used in magic host variables
+            self._inventory.clear_group_dict_cache()
 
         return changed
 
@@ -653,6 +697,7 @@ class StrategyBase:
                             obj=included_file._task._ds)
                 display.deprecated("You should not specify tags in the include parameters. All tags should be specified using the task-level option")
                 included_file._task.tags = tags
+
             ti_copy.vars = temp_vars
 
             block_list = load_list_of_blocks(
@@ -699,7 +744,7 @@ class StrategyBase:
             #        but this may take some work in the iterator and gets tricky when
             #        we consider the ability of meta tasks to flush handlers
             for handler in handler_block.block:
-                if handler in self._notified_handlers and len(self._notified_handlers[handler]):
+                if handler._uuid in self._notified_handlers and len(self._notified_handlers[handler._uuid]):
                     result = self._do_handler_run(handler, handler.get_name(), iterator=iterator, play_context=play_context)
                     if not result:
                         break
@@ -718,7 +763,7 @@ class StrategyBase:
         handler.name = saved_name
 
         if notified_hosts is None:
-            notified_hosts = self._notified_handlers[handler]
+            notified_hosts = self._notified_handlers[handler._uuid]
 
         run_once = False
         try:
@@ -763,6 +808,7 @@ class StrategyBase:
                     # of hosts which included the file to the notified_handlers dict
                     for block in new_blocks:
                         iterator._play.handlers.append(block)
+                        iterator.cache_block_tasks(block)
                         for task in block.block:
                             result = self._do_handler_run(
                                 handler=task,
@@ -781,7 +827,7 @@ class StrategyBase:
                     continue
 
         # wipe the notification list
-        self._notified_handlers[handler] = []
+        self._notified_handlers[handler._uuid] = []
         display.debug("done running handlers, result is: %s" % result)
         return result
 
@@ -798,7 +844,7 @@ class StrategyBase:
             display.debug("User ran task")
             ret = True
         elif resp.lower() in ['c', 'continue']:
-            display.debug("User ran task and cancled step mode")
+            display.debug("User ran task and canceled step mode")
             self._step = False
             ret = True
         else:
@@ -808,7 +854,7 @@ class StrategyBase:
 
         return ret
 
-    def _execute_meta(self, task, play_context, iterator, target_host=None):
+    def _execute_meta(self, task, play_context, iterator, target_host):
 
         # meta tasks store their args in the _raw_params field of args,
         # since they do not use k=v pairs, so get that
@@ -819,52 +865,52 @@ class StrategyBase:
         #   on a meta task that doesn't support them
 
         def _evaluate_conditional(h):
-            all_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=host, task=task)
+            all_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=h, task=task)
             templar = Templar(loader=self._loader, variables=all_vars)
             return task.evaluate_conditional(templar, all_vars)
 
-        if target_host:
-            host_list = [target_host]
-        else:
-            host_list = [host for host in self._inventory.get_hosts(iterator._play.hosts) if host.name not in self._tqm._unreachable_hosts]
-
-        results = []
-        for host in host_list:
-            result = None
-            if meta_action == 'noop':
-                # FIXME: issue a callback for the noop here?
-                result = TaskResult(host, task, dict(changed=False, msg="noop"))
-            elif meta_action == 'flush_handlers':
-                self.run_handlers(iterator, play_context)
-            elif meta_action == 'refresh_inventory':
-                self._inventory.refresh_inventory()
-                result = TaskResult(host, task, dict(changed=False, msg="inventory successfully refreshed"))
-            elif meta_action == 'clear_facts':
-                if _evaluate_conditional(host):
-                    self._variable_manager.clear_facts(target_host)
-                    result = TaskResult(host, task, dict(changed=True, msg="inventory successfully refreshed"))
-                else:
-                    result = TaskResult(host, task, dict(changed=False, skipped=True))
-            elif meta_action == 'clear_host_errors':
-                if _evaluate_conditional(host):
+        skipped = False
+        msg = ''
+        if meta_action == 'noop':
+            # FIXME: issue a callback for the noop here?
+            msg="noop"
+        elif meta_action == 'flush_handlers':
+            self.run_handlers(iterator, play_context)
+            msg = "ran handlers"
+        elif meta_action == 'refresh_inventory':
+            self._inventory.refresh_inventory()
+            msg = "inventory successfully refreshed"
+        elif meta_action == 'clear_facts':
+            if _evaluate_conditional(target_host):
+                for host in self._inventory.get_hosts(iterator._play.hosts):
+                    self._variable_manager.clear_facts(host)
+                msg = "facts cleared"
+            else:
+                skipped = True
+        elif meta_action == 'clear_host_errors':
+            if _evaluate_conditional(target_host):
+                for host in self._inventory.get_hosts(iterator._play.hosts):
                     self._tqm._failed_hosts.pop(host.name, False)
                     self._tqm._unreachable_hosts.pop(host.name, False)
                     iterator._host_states[host.name].fail_state = iterator.FAILED_NONE
-                    result = TaskResult(host, task, dict(changed=True, msg="successfully cleared host errors"))
-                else:
-                    result = TaskResult(host, task, dict(changed=False, skipped=True))
-            elif meta_action == 'end_play':
-                if _evaluate_conditional(host):
-                    iterator._host_states[host.name].run_state = iterator.ITERATING_COMPLETE
-                    result = TaskResult(host, task, dict(changed=True, msg="ending play"))
-                else:
-                    result = TaskResult(host, task, dict(changed=False, skipped=True))
-            #elif meta_action == 'reset_connection':
-            #    connection_info.connection.close()
+                msg="cleared host errors"
             else:
-                raise AnsibleError("invalid meta action requested: %s" % meta_action, obj=task._ds)
+                skipped = True
+        elif meta_action == 'end_play':
+            if _evaluate_conditional(target_host):
+                for host in self._inventory.get_hosts(iterator._play.hosts):
+                    if not host.name in  self._tqm._unreachable_hosts:
+                        iterator._host_states[host.name].run_state = iterator.ITERATING_COMPLETE
+                msg="ending play"
+        #elif meta_action == 'reset_connection':
+        #    connection_info.connection.close()
+        else:
+            raise AnsibleError("invalid meta action requested: %s" % meta_action, obj=task._ds)
 
-            if result is not None:
-                results.append(result)
+        result = { 'msg': msg }
+        if skipped:
+            result['skipped'] = True
+        else:
+            result['changed'] = False
 
-        return results
+        return [TaskResult(target_host, task, result)]
