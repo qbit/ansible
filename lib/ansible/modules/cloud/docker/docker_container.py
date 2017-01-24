@@ -207,6 +207,7 @@ options:
     description:
       - Specify the logging driver. Docker uses json-file by default.
     choices:
+      - none
       - json-file
       - syslog
       - journald
@@ -656,7 +657,10 @@ from ansible.module_utils.docker_common import *
 
 try:
     from docker import utils
-    from docker.utils.types import Ulimit
+    if HAS_DOCKER_PY_2:
+        from docker.types import Ulimit
+    else:
+        from docker.utils.types import Ulimit
 except:
     # missing docker-py handled in ansible.module_utils.docker
     pass
@@ -1958,7 +1962,9 @@ def main():
         kill_signal=dict(type='str'),
         labels=dict(type='dict'),
         links=dict(type='list'),
-        log_driver=dict(type='str', choices=['json-file', 'syslog', 'journald', 'gelf', 'fluentd', 'awslogs', 'splunk'], default=None),
+        log_driver=dict(type='str',
+                        choices=['none', 'json-file', 'syslog', 'journald', 'gelf', 'fluentd', 'awslogs', 'splunk'],
+                        default=None),
         log_options=dict(type='dict', aliases=['log_opt']),
         mac_address=dict(type='str'),
         memory=dict(type='str', default='0'),
